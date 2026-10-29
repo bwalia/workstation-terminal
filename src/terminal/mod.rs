@@ -124,6 +124,25 @@ pub fn base_env() -> Vec<(String, String)> {
     env
 }
 
+/// Whose a local tab's shell is: `SSHWEB_USER` (the terminal user) and, from their OpsAPI key when
+/// it says, `SSHWEB_USER_EMAIL` and `SSHWEB_USER_NAME`. Everyone's shells may run as one macOS
+/// account (`local.run_as`); these let its start-up files credit the person, e.g. in git commits.
+/// sudo keeps them (`SSHWEB_*` in packaging/sshweb.sudoers).
+pub fn identity_env(
+    user: &str,
+    key: Option<&crate::auth::keys::AuthorizedKey>,
+) -> Vec<(String, String)> {
+    let mut env = vec![("SSHWEB_USER".to_string(), user.to_string())];
+    let key = key.filter(|k| k.user == user);
+    if let Some(email) = key.and_then(|k| k.email.clone()) {
+        env.push(("SSHWEB_USER_EMAIL".into(), email));
+    }
+    if let Some(name) = key.and_then(|k| k.name.clone()) {
+        env.push(("SSHWEB_USER_NAME".into(), name));
+    }
+    env
+}
+
 /// Build the spec for a local interactive shell.
 pub fn local_shell_spec(
     cfg: &Config,

@@ -5,6 +5,7 @@ mod common;
 use std::time::Duration;
 
 use common::*;
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -67,6 +68,105 @@ async fn unauthenticated_socket_cannot_open_terminal() {
     ws.input("touch /tmp/should-not-exist\r").await;
     let msgs = ws.drain().await;
     assert!(msgs.iter().any(|m| m["code"] == "unauthenticated"));
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn sockets_must_sign_in_in_time_and_few_may_wait_per_address() {
+    let mut env = env();
+    env.cfg.limits.ws_auth_timeout_secs = 1;
+    env.cfg.limits.max_unauthenticated_websockets_per_ip = 2;
+    let srv = env.start().await;
+    let (port, base) = (env.cfg.server.port, env.base());
+    // Two sockets that haven't signed in may wait per address; a third is refused.
+    let mut a = ws_connect(port, Some(&base), None).await.unwrap();
+    let mut b = ws_connect(port, Some(&base), None).await.unwrap();
+    assert!(ws_connect(port, Some(&base), None).await.is_err());
+    // A signed-in browser doesn't count.
+    let (_c, mut browser) = logged_in_ws(&env).await;
+    // Signing in over the socket gives its place back.
+    a.hello().await;
+    a.send(json!({"type": "auth_request", "user": USER})).await;
+    let ch = a.expect_type("auth_challenge").await;
+    let sig = sign(&env.key, ch["message"].as_str().unwrap());
+    a.send(json!({"type": "auth_response", "challenge_id": ch["challenge_id"], "signature": sig}))
+        .await;
+    a.expect_type("auth_ok").await;
+    let _waiting = ws_connect(port, Some(&base), None).await.unwrap();
+    assert!(ws_connect(port, Some(&base), None).await.is_err());
+
+    // One that doesn't sign in is closed after the deadline, even while it keeps pinging.
+    b.hello().await;
+    let started = std::time::Instant::now();
+    let mut pinged = started - Duration::from_secs(1);
+    let mut seen = Vec::new();
+    loop {
+        assert!(started.elapsed() < Duration::from_secs(12), "still open: {seen:?}");
+        if pinged.elapsed() >= Duration::from_millis(500) {
+            pinged = std::time::Instant::now();
+            let _ = b.send_raw(Message::Ping(Default::default())).await;
+            let ping = json!({"type": "ping", "ts": 1}).to_string();
+            let _ = b.send_raw(Message::Text(ping.into())).await;
+        }
+        match tokio::time::timeout(Duration::from_millis(100), b.inner.next()).await {
+            Err(_) | Ok(Some(Ok(Message::Pong(_) | Message::Ping(_)))) => {}
+            Ok(Some(Ok(Message::Text(t)))) => seen.push(serde_json::from_str::<Value>(&t).unwrap()),
+            Ok(_) => break,
+        }
+    }
+    assert!(seen.iter().any(|m| m["type"] == "pong"), "pings were answered");
+    assert!(
+        seen.iter()
+            .any(|m| m["code"] == "auth_timeout" && m["fatal"] == true),
+        "{seen:?}"
+    );
+    // The signed-in ones stay.
+    for ws in [&mut a, &mut browser] {
+        ws.send(json!({"type": "ping", "ts": 2})).await;
+        assert_eq!(ws.expect_type("pong").await["ts"], 2);
+    }
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn shells_say_whose_they_are() {
+    use sshweb::auth::keys::{Access, AuthorizedKey, fingerprint};
+    let mut env = env();
+    let srv = env.start().await;
+    let who = r#"printf 'WHO<%s|%s|%s>\n' "$SSHWEB_USER" "$SSHWEB_USER_EMAIL" "$SSHWEB_USER_NAME""#;
+    // A key from the authorised keys file: only the user name is known.
+    let (_c, mut ws) = logged_in_ws(&env).await;
+    ws.open_local().await;
+    ws.input(&format!("{who}\r")).await;
+    ws.expect_output("WHO<alice||>").await;
+
+    // A key from OpsAPI with the person's email and name.
+    let key = new_key();
+    let now = sshweb::opsapi::unix_now();
+    let priya = AuthorizedKey {
+        user: "priya".into(),
+        access: Access {
+            local: true,
+            ..Access::default()
+        },
+        key: key.public_key().clone(),
+        fingerprint: fingerprint(key.public_key()),
+        line: 0,
+        email: Some("priya@example.com".into()),
+        name: Some("Priya Patel".into()),
+        expires_unix: Some(now + 3600),
+    };
+    srv.app.auth.keys.set_synced(vec![priya], now, now).unwrap();
+    let c = env.client();
+    c.login("priya", &key).await;
+    let cookie = c.cookie_header().unwrap();
+    let mut ws = ws_connect(env.cfg.server.port, Some(&env.base()), Some(&cookie))
+        .await
+        .unwrap();
+    ws.hello().await;
+    ws.open_local().await;
+    ws.input(&format!("{who}\r")).await;
+    ws.expect_output("WHO<priya|priya@example.com|Priya Patel>").await;
     srv.shutdown().await;
 }
 

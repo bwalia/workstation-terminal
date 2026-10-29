@@ -170,6 +170,8 @@ async fn a_local_tab_reports_claude_telemetry_and_its_screen_to_opsapi() {
     assert_eq!(tab["via"], "key");
     assert!(tab["key"].as_str().unwrap().starts_with("SHA256:"));
     assert!(tab["launch"].is_null() && tab["closed_at"].is_null());
+    assert_eq!(tab["attached"], true, "the browser is connected: {tab}");
+    assert!(tab.get("last_input_at").is_some(), "{tab}");
     assert_eq!(events.len(), 2, "only the tab's own posts: {events:?}");
     let mine: Vec<&Value> = events
         .iter()

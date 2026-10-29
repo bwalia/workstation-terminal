@@ -15,7 +15,7 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc};
 
 use crate::audit::AuditEvent;
 use crate::auth::sessions::Login;
-use crate::security::rate_limit::TokenBucket;
+use crate::security::rate_limit::{Slot, TokenBucket};
 use crate::server::{App, session_token_from_headers};
 use crate::session::{SessionEvent, Target, TerminalSession};
 use protocol::{ClientMsg, OpenTarget, PROTOCOL_VERSION, ServerMsg};
@@ -43,19 +43,30 @@ pub async fn ws_handler(
         );
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
-    let Ok(permit) = app.ws_slots.clone().try_acquire_owned() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "too many connections").into_response();
-    };
     let origin = origin.unwrap_or_default().to_string();
     // An existing browser login (cookie) authenticates the socket; otherwise the client must
     // complete the challenge over the socket before anything else is allowed.
     let login = session_token_from_headers(&app, &headers)
         .and_then(|tok| app.auth.validate(&tok).map(|l| (tok, l)));
+    // Until it signs in, a socket also takes one of its IP's few places, so one client can't
+    // hold every connection slot with sockets that never sign in.
+    let unauthenticated = match login {
+        Some(_) => None,
+        None => match app.ws_unauthenticated.try_take(&ip) {
+            Some(slot) => Some(slot),
+            None => {
+                return (StatusCode::TOO_MANY_REQUESTS, "too many connections").into_response();
+            }
+        },
+    };
+    let Ok(permit) = app.ws_slots.clone().try_acquire_owned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many connections").into_response();
+    };
     let max = app.cfg.limits.ws_max_message_bytes;
     ws.max_message_size(max)
         .max_frame_size(max)
         .on_upgrade(move |socket| async move {
-            run(app, socket, ip, origin, login, permit).await;
+            run(app, socket, ip, origin, login, unauthenticated, permit).await;
         })
 }
 
@@ -67,6 +78,8 @@ struct Conn {
     binding: String,
     hello: bool,
     login: Option<(String, Login)>,
+    /// The IP's place for a socket that hasn't signed in; given back when it does.
+    unauthenticated: Option<Slot>,
     session: Option<Arc<TerminalSession>>,
     events: Option<mpsc::Receiver<SessionEvent>>,
     bucket: TokenBucket,
@@ -91,6 +104,7 @@ async fn run(
     ip: String,
     origin: String,
     login: Option<(String, Login)>,
+    unauthenticated: Option<Slot>,
     _permit: OwnedSemaphorePermit,
 ) {
     let (mut sink, mut stream) = socket.split();
@@ -102,6 +116,7 @@ async fn run(
         binding: crate::security::random_token(32),
         hello: false,
         login,
+        unauthenticated,
         session: None,
         events: None,
         bucket: TokenBucket::new(limits.input_bytes_per_sec, limits.input_burst_bytes),
@@ -121,6 +136,7 @@ async fn run(
     );
 
     let started = Instant::now();
+    let auth_timeout = Duration::from_secs(limits.ws_auth_timeout_secs);
     let mut last_seen = Instant::now();
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     let mut last_ping = Instant::now();
@@ -155,6 +171,11 @@ async fn run(
                 if !c.hello && started.elapsed() > HELLO_TIMEOUT {
                     out.push(text(ServerMsg::error("hello_timeout", "no hello received", true)));
                     close_reason = "hello timeout";
+                    Flow::Close
+                } else if c.login.is_none() && started.elapsed() > auth_timeout {
+                    // Counted from connecting, so pings and pongs don't keep it open.
+                    out.push(text(ServerMsg::error("auth_timeout", "not signed in in time", true)));
+                    close_reason = "auth timeout";
                     Flow::Close
                 } else if last_seen.elapsed() > DEAD_PEER {
                     close_reason = "keepalive timeout";
@@ -341,6 +362,7 @@ impl Conn {
                             expires_unix: login.expires_unix,
                         }));
                         self.login = Some((tok, login));
+                        self.unauthenticated = None;
                     }
                     Err(e) => out.push(text(ServerMsg::AuthFailed {
                         code: e.code(),
@@ -475,7 +497,7 @@ impl Conn {
                             })
                     }
                 };
-                let (target, spec) = match built {
+                let (target, mut spec) = match built {
                     Ok(x) => x,
                     Err(msg) => {
                         app.audit.log(
@@ -488,6 +510,14 @@ impl Conn {
                         return Flow::Continue;
                     }
                 };
+                if let Target::Local { .. } = &target {
+                    let keys = app.auth.keys.current().ok();
+                    let key = keys
+                        .as_ref()
+                        .and_then(|k| k.by_fingerprint(&login.key_fingerprint));
+                    spec.env
+                        .extend(crate::terminal::identity_env(&login.user, key));
+                }
                 let name = name
                     .and_then(|n| crate::session::normalize_name(&n).ok().flatten())
                     .or_else(|| claimed.as_ref().map(|p| p.launch.tab_name()));

@@ -1,7 +1,7 @@
 //! Sending the work log to OpsAPI (§11.2 of the OpsAPI doc).
 //!
-//! - `POST {url}/activity` every 10 s while there is something new: `{terminal, sent_at, tabs,
-//!   events}`, `X-Opsapi-Signature: sha256=<hex HMAC of the body>`.
+//! - `POST {url}/activity` every 10 s while there is something new (an open tab is, once a minute):
+//!   `{terminal, sent_at, tabs, events}`, `X-Opsapi-Signature: sha256=<hex HMAC of the body>`.
 //! - `POST {url}/recordings` for each part as it is written: `X-Opsapi-Tab`, `X-Opsapi-Part`,
 //!   `X-Opsapi-Final`, signature over `"<tab>\n<part>\n" + body`.
 //!

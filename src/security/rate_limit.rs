@@ -1,7 +1,8 @@
-//! In-memory rate limiting, failure counting with temporary lockouts, and token buckets.
+//! In-memory rate limiting, failure counting with temporary lockouts, per-key caps and token
+//! buckets.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Allows at most `limit` events per `window` per key (sliding log).
@@ -128,6 +129,57 @@ impl FailureTracker {
     }
 }
 
+/// Caps how many things (open connections) each key holds at once.
+pub struct PerKeyCap {
+    max: usize,
+    held: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+/// One of a key's places under a [`PerKeyCap`], given back when dropped.
+pub struct Slot {
+    held: Arc<Mutex<HashMap<String, usize>>>,
+    key: String,
+}
+
+impl PerKeyCap {
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            held: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// A place for `key`, or None when it already holds `max`.
+    pub fn try_take(&self, key: &str) -> Option<Slot> {
+        let mut map = self.held.lock().unwrap();
+        let n = map.get(key).copied().unwrap_or(0);
+        if n >= self.max {
+            return None;
+        }
+        map.insert(key.to_string(), n + 1);
+        Some(Slot {
+            held: self.held.clone(),
+            key: key.to_string(),
+        })
+    }
+
+    pub fn held(&self, key: &str) -> usize {
+        self.held.lock().unwrap().get(key).copied().unwrap_or(0)
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut map = self.held.lock().unwrap();
+        if let Some(n) = map.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// Token bucket measured in bytes.
 pub struct TokenBucket {
     rate: f64,
@@ -211,6 +263,23 @@ mod tests {
         ft.record_failure("k");
         ft.record_success("k");
         assert!(!ft.record_failure("k"));
+    }
+
+    #[test]
+    fn per_key_cap_gives_places_back_when_dropped() {
+        let cap = PerKeyCap::new(2);
+        let a1 = cap.try_take("a").unwrap();
+        let a2 = cap.try_take("a").unwrap();
+        assert!(cap.try_take("a").is_none(), "full");
+        let b = cap.try_take("b");
+        assert!(b.is_some(), "keys are independent");
+        drop(a1);
+        assert_eq!(cap.held("a"), 1);
+        let _a3 = cap.try_take("a").unwrap();
+        drop(a2);
+        drop(b);
+        assert_eq!(cap.held("b"), 0);
+        assert_eq!(cap.held.lock().unwrap().len(), 1, "empty keys are forgotten");
     }
 
     #[test]

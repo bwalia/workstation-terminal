@@ -39,6 +39,8 @@ pub struct AppState {
     pub origin: OriginPolicy,
     pub shutdown: CancellationToken,
     pub ws_slots: Arc<Semaphore>,
+    /// WebSockets not signed in yet, per client IP (`limits.max_unauthenticated_websockets_per_ip`).
+    pub ws_unauthenticated: crate::security::rate_limit::PerKeyCap,
     pub workspaces: crate::workspace::WorkspaceStore,
     /// OpsAPI task links accepted by `POST /api/launch`.
     pub launches: crate::opsapi::LaunchStore,
@@ -57,6 +59,9 @@ impl AppState {
             sessions: SessionManager::new(cfg.clone(), audit.clone(), metrics.clone()),
             origin: OriginPolicy::from_config(&cfg),
             ws_slots: Arc::new(Semaphore::new(cfg.limits.max_websockets)),
+            ws_unauthenticated: crate::security::rate_limit::PerKeyCap::new(
+                cfg.limits.max_unauthenticated_websockets_per_ip,
+            ),
             workspaces: crate::workspace::WorkspaceStore::new(
                 cfg.server.state_dir.join("workspaces"),
             ),
@@ -113,10 +118,13 @@ pub fn get_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 /// The client IP used for rate limiting, lockouts and auditing. `X-Forwarded-For` is honoured
-/// only when the TCP peer is a configured trusted proxy; the right-most address that is not
-/// itself a trusted proxy is used. A trusted proxy that sends no `X-Forwarded-For` may report
-/// the client in `X-Real-IP` instead (single value, nginx `$remote_addr`). Anything unparsable
-/// falls back to the peer address.
+/// only when the TCP peer is a configured trusted proxy. Its hops (every header line, in order)
+/// are read from the right: trusted proxies are skipped and the first other hop is the client.
+/// Everything to its left came from the client itself and is ignored, garbage included, so a
+/// client can't make its failures count against the proxy. Only when that hop isn't an address
+/// (a trusted proxy sent garbage) does it fall back to the peer. A trusted proxy that sends no
+/// `X-Forwarded-For` may report the client in `X-Real-IP` instead (single value, nginx
+/// `$remote_addr`).
 pub fn client_ip(cfg: &Config, peer: SocketAddr, headers: &HeaderMap) -> std::net::IpAddr {
     let trusted = &cfg.server.trusted_proxies;
     if !trusted.contains(&peer.ip()) {
@@ -130,23 +138,22 @@ pub fn client_ip(cfg: &Config, peer: SocketAddr, headers: &HeaderMap) -> std::ne
             .filter(|ip| !trusted.contains(ip))
             .unwrap_or(peer.ip());
     }
-    let mut chain = Vec::new();
-    for v in headers.get_all("x-forwarded-for") {
-        let Ok(s) = v.to_str() else {
-            return peer.ip();
-        };
-        for part in s.split(',') {
-            match part.trim().parse::<std::net::IpAddr>() {
-                Ok(ip) => chain.push(ip),
-                Err(_) => return peer.ip(),
-            }
+    let lines: Vec<&[u8]> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .map(|v| v.as_bytes())
+        .collect();
+    for hop in lines.iter().rev().flat_map(|l| l.rsplit(|b| *b == b',')) {
+        let ip = std::str::from_utf8(hop)
+            .ok()
+            .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok());
+        match ip {
+            Some(ip) if trusted.contains(&ip) => continue,
+            Some(ip) => return ip,
+            None => return peer.ip(),
         }
     }
-    chain
-        .into_iter()
-        .rev()
-        .find(|ip| !trusted.contains(ip))
-        .unwrap_or(peer.ip())
+    peer.ip()
 }
 
 pub fn session_token_from_headers(app: &AppState, headers: &HeaderMap) -> Option<String> {
@@ -226,12 +233,19 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// The page's own background polls send `X-Sshweb-Poll: 1`. They don't count as activity, so a
+/// page left open doesn't keep its login from going idle.
+pub const POLL_HEADER: &str = "x-sshweb-poll";
+
 fn require_login(app: &AppState, headers: &HeaderMap) -> Result<(String, Login), ApiError> {
     let tok = session_token_from_headers(app, headers).ok_or_else(ApiError::unauthenticated)?;
-    let login = app
-        .auth
-        .validate(&tok)
-        .ok_or_else(ApiError::unauthenticated)?;
+    let poll = headers.get(POLL_HEADER).is_some_and(|v| v.as_bytes() == b"1");
+    let login = if poll {
+        app.auth.validate_quietly(&tok)
+    } else {
+        app.auth.validate(&tok)
+    };
+    let login = login.ok_or_else(ApiError::unauthenticated)?;
     Ok((tok, login))
 }
 
@@ -691,7 +705,7 @@ async fn launch_login(
     }
     app.auth.admit(&ip)?;
     let now = crate::opsapi::unix_now();
-    let (launch, key) = match autologin_key(&app, &req.ticket, &ip, now) {
+    let (launch, key) = match autologin_key(&app, &req.ticket, now) {
         Ok(v) => v,
         Err(f) => {
             let AutologinFailure {
@@ -738,7 +752,7 @@ async fn launch_login(
 }
 
 /// Why `/api/launch/login` refused, with the OpsAPI user from the link and the mapped terminal
-/// user when known (for the audit log and lock-out).
+/// user when known (for the audit log).
 struct AutologinFailure {
     who: Option<crate::opsapi::LoginClaim>,
     user: Option<String>,
@@ -749,7 +763,6 @@ struct AutologinFailure {
 fn autologin_key(
     app: &AppState,
     ticket: &str,
-    ip: &str,
     now: u64,
 ) -> Result<(crate::opsapi::Launch, crate::auth::keys::AuthorizedKey), Box<AutologinFailure>> {
     use crate::opsapi::AutologinError;
@@ -782,9 +795,6 @@ fn autologin_key(
             fail(None, ApiError::new(status, e.code(), e.to_string()))
         })?;
     let user = user.as_str();
-    app.auth
-        .check_lockout(ip, Some(user))
-        .map_err(|e| fail(Some(user), e.into()))?;
     let key = keys
         .for_user(user)
         .find(|k| k.access.local)
@@ -1262,6 +1272,39 @@ mod tests {
         // Garbage or absent header: fall back to the peer.
         assert_eq!(client_ip(&cfg, proxy, &h(&["not-an-ip"])), proxy.ip());
         assert_eq!(client_ip(&cfg, proxy, &h(&[])), proxy.ip());
+    }
+
+    #[test]
+    fn client_ip_reads_forwarded_for_from_the_right() {
+        let mut cfg = Config::default();
+        let proxy: SocketAddr = "172.16.0.99:5000".parse().unwrap();
+        cfg.server.trusted_proxies = ["172.16.0.99", "10.0.0.1", "10.0.0.2"]
+            .map(|s| s.parse().unwrap())
+            .into();
+        let ip = |xff: &[&str]| client_ip(&cfg, proxy, &h(xff)).to_string();
+        // Whatever the client put on the left is ignored: garbage, a spoofed address, or both.
+        assert_eq!(ip(&["not-an-ip, 203.0.113.9"]), "203.0.113.9");
+        assert_eq!(ip(&["not-an-ip", "203.0.113.9"]), "203.0.113.9");
+        assert_eq!(ip(&[", ,;x, 203.0.113.9"]), "203.0.113.9");
+        assert_eq!(ip(&["10.0.0.1, 203.0.113.9"]), "203.0.113.9");
+        assert_eq!(ip(&["6.6.6.6, garbage, 203.0.113.9"]), "203.0.113.9");
+        let mut raw = HeaderMap::new();
+        raw.append(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(b"\xff\xfe, 203.0.113.9").unwrap(),
+        );
+        assert_eq!(client_ip(&cfg, proxy, &raw).to_string(), "203.0.113.9");
+        // A chain of trusted proxies is skipped.
+        assert_eq!(
+            ip(&["6.6.6.6, 203.0.113.9, 10.0.0.2", "10.0.0.1"]),
+            "203.0.113.9"
+        );
+        // Only garbage where the client should be (from a trusted proxy) falls back to the peer.
+        assert_eq!(ip(&["203.0.113.9, garbage"]), "172.16.0.99");
+        assert_eq!(ip(&["203.0.113.9, garbage, 10.0.0.1"]), "172.16.0.99");
+        assert_eq!(ip(&["203.0.113.9,"]), "172.16.0.99");
+        // Nothing but trusted proxies: the peer.
+        assert_eq!(ip(&["10.0.0.2, 10.0.0.1"]), "172.16.0.99");
     }
 
     #[test]

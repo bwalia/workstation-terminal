@@ -130,6 +130,7 @@ details { margin: 10px 0; }
   border-bottom: 1px solid var(--border); background: var(--panel);
 }
 .toolbar .title { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.toolbar .hint { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .terminals { flex: 1; min-height: 0; position: relative; }
 .terminal { position: absolute; inset: 0; padding: 6px 0 0 8px; }
 .empty { padding: 40px; text-align: center; color: var(--text); }
@@ -169,4 +170,5 @@ kbd { border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; backg
   #view-term { flex-direction: column; }
   .sidebar { width: auto; border-right: 0; border-bottom: 1px solid var(--border); max-height: 40vh; }
   .grid2 { grid-template-columns: 1fr; }
+  .toolbar .hint { display: none; }
 }

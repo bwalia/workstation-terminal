@@ -184,6 +184,8 @@ real PTY, running as the user who runs sshweb. Users can choose any shell listed
 
 - Output is streamed as raw bytes, so colours, cursor movement, alternate screen (vim, less, top) and
   mouse modes work. Keyboard input, including Ctrl+C/D/Z, goes to the PTY, and resizes are applied with `TIOCSWINSZ`.
+- **Copying:** drag to select. While a program uses the mouse (Claude Code, vim, less, tmux), hold ⌥ Option
+  (Shift on Windows and Linux) while you drag. ⌘C or a right-click on the selection copies it.
 - When the shell exits the session closes and its exit code is shown. On close, disconnect timeout,
   idle timeout or shutdown, the whole process group gets SIGHUP and then SIGKILL.
 - **Reconnects:** if the network drops, the page reconnects automatically with backoff and replays
@@ -199,7 +201,10 @@ named in `local.run_as`. With `run_as`, sshweb (unprivileged, under its own acco
 account through a narrow sudo rule, so what runs in a terminal can't read the gateway's config, secrets,
 TLS key or logs: see [Shells as another account](docs/OPSAPI.md#shells-as-another-account). Signals to
 those shells also go through that rule. On macOS, `local.sandbox_profile` also keeps them to their folder and the
-web: see [Shells locked to their folder](docs/OPSAPI.md#shells-locked-to-their-folder).
+web: see [Shells locked to their folder](docs/OPSAPI.md#shells-locked-to-their-folder). Each local shell gets
+`SSHWEB_USER` (and, for keys issued in OpsAPI, `SSHWEB_USER_EMAIL` and `SSHWEB_USER_NAME`), so the shared
+account's start-up files can credit the person, e.g. in git commits: see
+[Crediting each person](docs/OPSAPI.md#crediting-each-person).
 
 ## OpsAPI task links
 
@@ -315,7 +320,9 @@ If browsers reach sshweb through a proxy (e.g. `https://dev.example.net` → `ht
   logins and other API calls fail with *cross-origin request rejected*, and WebSockets get 403.
 - Add the proxy's IP to `server.trusted_proxies`, so rate limits, lockouts and the audit log use the real client
   IP from `X-Forwarded-For` (or `X-Real-IP` when the proxy sends no `X-Forwarded-For`). Both headers are
-  ignored from any other peer.
+  ignored from any other peer. `X-Forwarded-For` is read from the right: the first hop that isn't a trusted
+  proxy is the client, and whatever the client itself sent to the left of it is ignored. List every proxy in
+  the chain.
 - The proxy must: pass `Origin` and `Cookie` through **unchanged** (never rewrite `Origin`, which would disable
   CSRF and WebSocket-hijacking protection); support WebSocket upgrades on `/ws`; set `X-Forwarded-For`;
   use long read timeouts (hours) and no response buffering for `/ws`; and pass `Set-Cookie` through unchanged.
@@ -421,7 +428,7 @@ The manual browser test procedure, including vim, is in [docs/TESTING.md](docs/T
 |---|---|
 | `authentication failed` | Request a **new** challenge (each one is single-use and expires). Sign with `-n sshweb-auth`. Check `sshweb keys list` shows your key's fingerprint (`ssh-keygen -lf key.pub`) for the user name you typed. |
 | `authentication is unavailable` / `/readyz` 503 | `authorized_keys` is missing, has unsafe permissions or a malformed line: run `sshweb config validate`. |
-| `locked out` (HTTP 429) | Too many failures from your IP or for that user. Wait `rate_limit.lockout_secs`, or restart the server. |
+| `locked out` (HTTP 429) | Too many failures from your IP. Wait `rate_limit.lockout_secs`, or restart the server. |
 | `ssh-keygen: unknown option -- Y` | OpenSSH older than 8.1 on the client; upgrade it. |
 | Signing with an agent key | `ssh-keygen -Y sign -n sshweb-auth -f ~/.ssh/key.pub` (the **.pub** file). |
 | Page loads but WebSocket fails / 403 | You're using a host name or port that isn't allowed. Add the exact `https://host:port` to `server.allowed_origins`. |

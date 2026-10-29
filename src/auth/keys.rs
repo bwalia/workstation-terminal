@@ -88,6 +88,8 @@ pub struct AuthorizedKey {
     pub line: usize,
     /// OpsAPI keys: the person's OpsAPI email (lower case), so a launch link can sign them in.
     pub email: Option<String>,
+    /// OpsAPI keys: the person's name, when OpsAPI sends it (for `SSHWEB_USER_NAME`).
+    pub name: Option<String>,
     /// OpsAPI keys: when the key stops working.
     pub expires_unix: Option<u64>,
 }
@@ -220,6 +222,7 @@ pub fn parse_line(
         key,
         line: line_no,
         email: None,
+        name: None,
         expires_unix: None,
     }))
 }
@@ -519,6 +522,7 @@ mod tests {
             key,
             line: 0,
             email: Some(format!("{user}@example.com")),
+            name: None,
             expires_unix: Some(expires_unix),
         }
     }

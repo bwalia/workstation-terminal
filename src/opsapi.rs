@@ -156,6 +156,11 @@ pub enum LinkError {
     Expired,
     #[error("task links aren't set up on this terminal")]
     NotConfigured,
+    #[error(
+        "this task's text starts with \"-\", which the agent would take as an option; \
+         change the start of the task text in OpsAPI and open it again"
+    )]
+    PromptIsOption,
 }
 
 /// One line of text: no control characters, at most `max` characters.
@@ -227,6 +232,12 @@ pub fn verify_ticket(secret: &str, ticket: &str, now: u64) -> Result<Launch, Lin
     if let Some(r) = &c.report {
         bad(valid_url(&r.url, 512) && valid_report_token(&r.token))?;
     }
+    // Agents get the prompt as an argument. The documented run lines put `--` before it, but a
+    // line without one would read a prompt like `--settings=…` as an option.
+    let prompt = clean_prompt(&c.prompt);
+    if prompt.trim_start().starts_with('-') {
+        return Err(LinkError::PromptIsOption);
+    }
     Ok(Launch {
         id: c.id.to_ascii_lowercase(),
         task: c.task.to_ascii_lowercase(),
@@ -234,7 +245,7 @@ pub fn verify_ticket(secret: &str, ticket: &str, now: u64) -> Result<Launch, Lin
         title,
         path: c.path,
         agent: c.agent,
-        prompt: clean_prompt(&c.prompt),
+        prompt,
         by,
         return_url: c.return_url,
         workspace,
@@ -279,6 +290,7 @@ impl LinkError {
             LinkError::Expired => "expired",
             LinkError::NotConfigured => "not_configured",
             LinkError::Invalid => "invalid_link",
+            LinkError::PromptIsOption => "prompt_starts_with_dash",
         }
     }
 }
@@ -332,6 +344,9 @@ struct KeyEntry {
     expires_unix: u64,
     #[serde(default)]
     email: Option<String>,
+    /// The person's name (newer OpsAPI); one line, at most 120 characters.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// Check OpsAPI's answer and turn it into keys: it must be signed with the shared secret
@@ -366,6 +381,14 @@ pub fn parse_keys_answer(
             continue;
         };
         let email = e.email.map(|m| m.to_ascii_lowercase());
+        // Only shown to the person's shells, so a bad one is left out rather than the key.
+        let name = e.name.as_deref().and_then(|n| {
+            let n = one_line(n, 120);
+            if n.is_none() {
+                warn!(user = %e.user, "opsapi key list: a name isn't valid; left out");
+            }
+            n.filter(|n| !n.is_empty())
+        });
         let key = match PublicKey::from_openssh(&e.public_key) {
             Ok(k) if check_key_strength(k.key_data(), min_rsa_bits).is_ok() => k,
             _ => {
@@ -392,6 +415,7 @@ pub fn parse_keys_answer(
             fingerprint,
             line: 0,
             email,
+            name,
             expires_unix: Some(e.expires_unix),
         });
     }
@@ -811,6 +835,23 @@ pub mod tests {
     }
 
     #[test]
+    fn prompts_that_start_with_a_dash_are_refused() {
+        let now = 1_800_000_000;
+        let with = |p: &str| {
+            let mut c = claims(now, "/srv/x");
+            c["prompt"] = json!(p);
+            verify_ticket(SECRET, &mint(SECRET, c), now)
+        };
+        for p in ["-p", "--settings=/tmp/evil.json", "  \n\t--model x", "\u{1b}-x"] {
+            assert_eq!(with(p), Err(LinkError::PromptIsOption), "{p:?}");
+        }
+        assert_eq!(with("-p").unwrap_err().code(), "prompt_starts_with_dash");
+        for p in ["", "Fix the --verbose flag", "— a dash of style", "x -y"] {
+            assert!(with(p).is_ok(), "{p:?}");
+        }
+    }
+
+    #[test]
     fn folders_must_be_real_directories_inside_a_root() {
         let base = tempfile::tempdir().unwrap();
         let root = base.path().join("projects");
@@ -1146,6 +1187,31 @@ pub mod tests {
         ] {
             assert!(parse_keys_answer(secret, term, body, sig, at, 2048).is_err());
         }
+    }
+
+    #[test]
+    fn opsapi_keys_carry_an_optional_name() {
+        let now = 1_800_000_000;
+        let (body, sig) = keys_answer(
+            now,
+            json!([
+                {"user": "priya", "public_key": ed_line(1), "expires_unix": now + 3600,
+                 "email": "priya@example.com", "name": "  Priya Patel "},
+                {"user": "sam", "public_key": ed_line(2), "expires_unix": now + 3600,
+                 "name": "Sam\nEvil"},
+                {"user": "old", "public_key": ed_line(3), "expires_unix": now + 3600}
+            ]),
+        );
+        let (_, keys) = parse_keys_answer(SECRET, TERM, &body, &sig, now, 2048).unwrap();
+        let names: Vec<_> = keys
+            .iter()
+            .map(|k| (k.user.as_str(), k.name.as_deref()))
+            .collect();
+        assert_eq!(
+            names,
+            [("priya", Some("Priya Patel")), ("sam", None), ("old", None)],
+            "a bad name is left out, the key kept"
+        );
     }
 
     #[test]

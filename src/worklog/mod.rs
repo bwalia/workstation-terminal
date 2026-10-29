@@ -1,7 +1,8 @@
 //! Work log for OpsAPI (`opsapi.work_log`, §11 of the OpsAPI doc).
 //!
 //! - **Tabs.** Every session (a "tab", local or remote) is reported: who opened it and how, the
-//!   task and folder, how it ended, active seconds and bytes in/out.
+//!   task and folder, how it ended, active seconds, bytes in/out, the last input and whether a
+//!   browser is attached. Open tabs are re-sent once a minute, so OpsAPI can show them as live.
 //! - **Claude Code telemetry.** Each local tab's shell gets a random token and Claude's
 //!   OpenTelemetry settings pointing at a loopback-only receiver ([`otlp`]); the token names the
 //!   tab. Prompts, model requests, tool results and decisions, API errors and four metrics are
@@ -18,7 +19,7 @@ pub mod otlp;
 pub mod recorder;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,8 +38,10 @@ const MAX_QUEUED_EVENTS: usize = 20_000;
 const MAX_EVENT_BYTES: usize = 1024 * 1024;
 /// A tab is active in a tick when it had input or output in the last 60 s.
 const ACTIVE_WINDOW_SECS: u64 = 60;
-/// An open tab whose state changed is re-sent at most this often.
-const RESEND_AFTER: Duration = Duration::from_secs(60);
+/// An open tab is re-sent this long after OpsAPI last took it, changed or not (a heartbeat, so
+/// OpsAPI can tell a live tab from one whose gateway went away). With the 10 s tick that is once a
+/// minute; changes wait for it too.
+const HEARTBEAT: Duration = Duration::from_secs(50);
 pub const TICK: Duration = Duration::from_secs(10);
 /// Dropped unattributed posts are audited at most this often.
 const UNATTRIBUTED_AUDIT_EVERY: Duration = Duration::from_secs(60);
@@ -92,6 +95,10 @@ pub struct Tab {
     active_secs: AtomicU64,
     /// Seconds after `started` of the last input or output, plus one (0: none yet).
     last_active: AtomicU64,
+    /// Unix seconds of the last input (0: none yet).
+    last_input_at: AtomicU64,
+    /// A browser is attached to the session.
+    attached: AtomicBool,
     end: Mutex<Option<End>>,
     /// The state OpsAPI last acknowledged, and when.
     acked: Mutex<Option<(String, Instant)>>,
@@ -106,7 +113,13 @@ impl Tab {
 
     pub fn input(&self, n: usize) {
         self.input_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        self.last_input_at.store(unix_now(), Ordering::Relaxed);
         self.touch();
+    }
+
+    /// A browser attached to the session (true) or went away (false).
+    pub fn set_attached(&self, attached: bool) {
+        self.attached.store(attached, Ordering::Relaxed);
     }
 
     /// PTY output, whether or not a browser is attached.
@@ -150,14 +163,20 @@ impl Tab {
             "active_secs": self.active_secs.load(Ordering::Relaxed),
             "input_bytes": self.input_bytes.load(Ordering::Relaxed),
             "output_bytes": self.output_bytes.load(Ordering::Relaxed),
+            "last_input_at": match self.last_input_at.load(Ordering::Relaxed) {
+                0 => None,
+                t => Some(t),
+            },
+            "attached": self.attached.load(Ordering::Relaxed),
         })
     }
 
-    /// Send at open, at close, and every 60 s while it changes.
+    /// Send at open, at close, and once a minute while open (changed or not).
     fn due(&self, state: &str) -> bool {
         match &*self.acked.lock().unwrap() {
             None => true,
-            Some((s, at)) => s != state && (self.is_closed() || at.elapsed() >= RESEND_AFTER),
+            Some((s, _)) if self.is_closed() => s != state,
+            Some((_, at)) => at.elapsed() >= HEARTBEAT,
         }
     }
 }
@@ -288,6 +307,8 @@ impl WorkLog {
             output_bytes: AtomicU64::new(0),
             active_secs: AtomicU64::new(0),
             last_active: AtomicU64::new(0),
+            last_input_at: AtomicU64::new(0),
+            attached: AtomicBool::new(false),
             end: Mutex::new(None),
             acked: Mutex::new(None),
             recorder,
@@ -316,6 +337,7 @@ impl WorkLog {
             reason: reason.to_string(),
             exit_code,
         });
+        tab.set_attached(false);
         if let Some(h) = tab.token_hash {
             self.tokens.lock().unwrap().remove(&h);
         }
@@ -591,9 +613,9 @@ mod tests {
         // Not taken yet: the same again.
         assert_eq!(w.batch(1792828054).unwrap().body, b.body);
         assert_eq!(w.ack(&b), 0);
-        assert!(w.batch(2).is_none(), "an unchanged open tab isn't re-sent");
+        assert!(w.batch(2).is_none(), "an open tab isn't re-sent within the minute");
         tab.output(b"x");
-        assert!(w.batch(2).is_none(), "a changed open tab waits 60 s");
+        assert!(w.batch(2).is_none(), "nor when it changed");
 
         w.close_tab(&tab, "process exited", Some(3));
         let b = w.batch(3).unwrap();
@@ -605,6 +627,55 @@ mod tests {
         w.ack(&b);
         assert!(w.tabs.lock().unwrap().is_empty(), "closed tab forgotten");
         assert!(w.batch(4).is_none());
+    }
+
+    #[test]
+    fn open_tabs_are_re_sent_every_minute_with_their_last_input_and_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = work_log(dir.path());
+        let local = Target::Local {
+            shell: "/bin/sh".into(),
+        };
+        let (tab, _) = w.new_tab("t1", &login(), &local, &spec(), None);
+        w.register(&tab);
+        let tab_state = |b: &Batch| -> Value {
+            let v: Value = serde_json::from_str(&b.body).unwrap();
+            v["tabs"][0].clone()
+        };
+        // Pretend OpsAPI took the tab a minute ago.
+        let a_minute_ago = |t: &Tab| {
+            let mut acked = t.acked.lock().unwrap();
+            let at = &mut acked.as_mut().unwrap().1;
+            *at = at.checked_sub(HEARTBEAT).unwrap();
+        };
+        let b = w.batch(1).unwrap();
+        let first = tab_state(&b);
+        assert!(first["last_input_at"].is_null(), "{first}");
+        assert_eq!(first["attached"], false);
+        w.ack(&b);
+        assert!(w.batch(2).is_none());
+
+        // Unchanged, but still open: sent again, so OpsAPI knows it is live.
+        a_minute_ago(&tab);
+        let b = w.batch(3).unwrap();
+        assert_eq!(tab_state(&b), first);
+        w.ack(&b);
+
+        let before = unix_now();
+        tab.set_attached(true);
+        tab.input(2);
+        a_minute_ago(&tab);
+        let b = w.batch(4).unwrap();
+        let t = tab_state(&b);
+        assert_eq!(t["attached"], true);
+        assert!(t["last_input_at"].as_u64().unwrap() >= before, "{t}");
+        w.ack(&b);
+
+        w.close_tab(&tab, "closed by user", None);
+        let b = w.batch(5).unwrap();
+        assert_eq!(tab_state(&b)["attached"], false, "a closed tab has no browser");
+        w.ack(&b);
+        assert!(w.batch(6).is_none(), "closed tabs aren't re-sent");
     }
 
     #[test]

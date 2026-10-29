@@ -26,10 +26,44 @@
   (subpath (string-append (param "HOME") "/.config/gh"))
   (subpath (string-append (param "HOME") "/.config/git")))
 
+;; Places whose contents run in everyone's sessions stay as the administrator left them too, so
+;; nobody can plant something there that runs when a colleague starts Claude or a shell: Claude's
+;; commands, agents, skills, plugins, hooks, memory and local settings, and the folders on PATH or
+;; loaded by zsh. Claude still keeps its own state (~/.claude.json, ~/.claude/projects, todos, ...).
+(deny file-write*
+  (subpath (string-append (param "HOME") "/.claude/commands"))
+  (subpath (string-append (param "HOME") "/.claude/agents"))
+  (subpath (string-append (param "HOME") "/.claude/skills"))
+  (subpath (string-append (param "HOME") "/.claude/plugins"))
+  (subpath (string-append (param "HOME") "/.claude/hooks"))
+  (literal (string-append (param "HOME") "/.claude/CLAUDE.md"))
+  (literal (string-append (param "HOME") "/.claude/settings.local.json"))
+  (subpath (string-append (param "HOME") "/.local/bin"))
+  ;; The Claude that ~/.local/bin/claude points to. Claude can't update itself from a tab; update
+  ;; it as the account: sudo -iu workstation claude update.
+  (subpath (string-append (param "HOME") "/.local/share/claude"))
+  (subpath (string-append (param "HOME") "/bin"))
+  (subpath (string-append (param "HOME") "/.oh-my-zsh"))
+  (subpath (string-append (param "HOME") "/.zsh"))
+  ;; ...nor can their folders be moved aside and replaced (by a link to a folder of one's own).
+  (literal (string-append (param "HOME") "/.claude"))
+  (literal (string-append (param "HOME") "/.config"))
+  (literal (string-append (param "HOME") "/.local")))
+
+;; Processes. A shell can inspect (open files, folder, path) and signal only what was started in its
+;; own tab (its sandbox), not other people's shells and agents or the gateway. The list of processes
+;; and their command lines (`pgrep -fl`) stays visible.
+(deny process-info*)
+(allow process-info* (target same-sandbox))
+(deny signal)
+(allow signal (target same-sandbox))
+
 ;; Network. Out to the web only (GitHub, Claude, OpsAPI, package registries): ports 443 and 80.
 ;; Nothing else, so not the services running on this Mac or the local network (databases, AI
 ;; servers, dashboards, file and screen sharing). Exceptions on this Mac: the work log's receiver
-;; and the usual ports of a dev server someone starts in their own terminal.
+;; and the usual ports of a dev server someone starts in their own terminal. A sandbox profile
+;; can't name address ranges, so local-network hosts on 443 and 80 stay reachable: block those with
+;; pf (docs/OPSAPI.md, "Shells locked to their folder").
 (deny network-outbound (remote ip "*:*"))
 (allow network-outbound
   (remote tcp "*:443")

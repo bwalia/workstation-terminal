@@ -146,8 +146,9 @@ pub struct AgentConfig {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
-    /// Shell command line run in the task folder, e.g. `claude "$OPSAPI_TASK_PROMPT"`.
-    /// The task text is only available through the OPSAPI_* environment variables.
+    /// Shell command line run in the task folder, e.g. `claude -- "$OPSAPI_TASK_PROMPT"` (`--` so
+    /// the prompt is never read as an option). The task text is only available through the
+    /// OPSAPI_* environment variables.
     pub run: String,
 }
 
@@ -274,6 +275,10 @@ pub struct SessionConfig {
 pub struct LimitsConfig {
     pub ws_max_message_bytes: usize,
     pub max_websockets: usize,
+    /// A WebSocket that hasn't signed in this long after connecting is closed.
+    pub ws_auth_timeout_secs: u64,
+    /// WebSockets not signed in yet, per client IP, so one client can't take every slot.
+    pub max_unauthenticated_websockets_per_ip: usize,
     pub input_bytes_per_sec: u64,
     pub input_burst_bytes: u64,
     pub max_http_body_bytes: usize,
@@ -439,6 +444,8 @@ impl Default for LimitsConfig {
         Self {
             ws_max_message_bytes: 64 * 1024,
             max_websockets: 64,
+            ws_auth_timeout_secs: 30,
+            max_unauthenticated_websockets_per_ip: 8,
             input_bytes_per_sec: 256 * 1024,
             input_burst_bytes: 1024 * 1024,
             max_http_body_bytes: 32 * 1024,
@@ -922,6 +929,13 @@ impl Config {
         }
         if l.max_websockets == 0 {
             errs.push("limits.max_websockets must be positive".into());
+        }
+        if l.ws_auth_timeout_secs == 0 || l.max_unauthenticated_websockets_per_ip == 0 {
+            errs.push(
+                "limits.ws_auth_timeout_secs and limits.max_unauthenticated_websockets_per_ip \
+                 must be positive"
+                    .into(),
+            );
         }
         let rl = &self.rate_limit;
         if rl.challenges_per_minute == 0 || rl.max_failures == 0 {

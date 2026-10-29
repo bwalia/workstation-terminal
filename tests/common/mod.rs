@@ -96,9 +96,18 @@ impl Env {
 
     /// HTTP client with a cookie jar that sends our Origin on every request.
     pub fn client(&self) -> Client {
+        self.client_via(None)
+    }
+
+    /// Like [`client`](Self::client), and with `X-Forwarded-For: <ip>` (a client behind a proxy
+    /// in `server.trusted_proxies`).
+    pub fn client_via(&self, forwarded_for: Option<&str>) -> Client {
         let jar = Arc::new(reqwest::cookie::Jar::default());
         let mut h = reqwest::header::HeaderMap::new();
         h.insert("origin", self.base().parse().unwrap());
+        if let Some(ip) = forwarded_for {
+            h.insert("x-forwarded-for", ip.parse().unwrap());
+        }
         let http = reqwest::Client::builder()
             .cookie_provider(jar.clone())
             .default_headers(h)

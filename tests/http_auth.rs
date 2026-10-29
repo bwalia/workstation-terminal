@@ -313,8 +313,9 @@ async fn challenge_rate_limit() {
 async fn lockout_after_repeated_failures() {
     let mut env = env();
     env.cfg.rate_limit.max_failures = 3;
+    env.cfg.server.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
     let srv = env.start().await;
-    let c = env.client();
+    let c = env.client_via(Some("203.0.113.5"));
     let wrong = new_key();
     for _ in 0..3 {
         let ch: Value = c.challenge(USER).await.json().await.unwrap();
@@ -326,13 +327,46 @@ async fn lockout_after_repeated_failures() {
             .await;
         assert_eq!(r.status(), 401);
     }
-    // Locked out: even the correct key is refused for now.
+    // Locked out: even the correct key is refused from that address for now.
     let r = c.challenge(USER).await;
     assert_eq!(r.status(), 429);
     let body: Value = r.json().await.unwrap();
     assert_eq!(body["error"], "locked_out");
+    // The user name isn't locked: from anywhere else they sign in as usual, so nobody can lock
+    // a named person out by sending bad signatures for them.
+    env.client_via(Some("203.0.113.6"))
+        .login(USER, &env.key)
+        .await;
     srv.shutdown().await;
     assert!(env.audit_log().contains("\"event\":\"auth_lockout\""));
+}
+
+#[tokio::test]
+async fn background_polls_do_not_keep_a_login_alive() {
+    let mut env = env();
+    env.cfg.auth.session_idle_timeout_secs = 2;
+    let srv = env.start().await;
+    let (left_open, in_use) = (env.client(), env.client());
+    left_open.login(USER, &env.key).await;
+    in_use.login(USER, &env.key).await;
+    let sessions = |c: &Client, poll: bool| {
+        let mut r = c.http.get(c.url("/api/sessions"));
+        if poll {
+            r = r.header("x-sshweb-poll", "1");
+        }
+        async move { r.send().await.unwrap().status().as_u16() }
+    };
+    let (mut polled, mut used) = (Vec::new(), Vec::new());
+    for _ in 0..6 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        polled.push(sessions(&left_open, true).await);
+        used.push(sessions(&in_use, false).await);
+    }
+    // A page that only polls goes idle; one that is used stays signed in.
+    assert_eq!(polled.first(), Some(&200), "{polled:?}");
+    assert_eq!(polled.last(), Some(&401), "{polled:?}");
+    assert!(used.iter().all(|s| *s == 200), "{used:?}");
+    srv.shutdown().await;
 }
 
 #[tokio::test]

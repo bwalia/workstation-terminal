@@ -53,7 +53,7 @@ The server never parses the message back from the client; it verifies against th
 | Bound to the requesting browser/session | HttpOnly binding cookie (HTTP flow) or the socket's binding secret (WebSocket flow) |
 | Domain separation | Namespace `sshweb-auth` and the `sshweb-auth-v1` message prefix |
 | No user enumeration | Unknown users still get a challenge, and failures return a generic error |
-| Brute-force resistance | Per-IP challenge rate limit, plus lockouts per IP and per user |
+| Brute-force resistance | Per-IP challenge rate limit and per-IP lockouts. User names aren't locked: signatures can't be guessed, and anyone could lock a named person out |
 | Audit | `auth_challenge`, `auth_success`, `auth_failure` (with reason), `auth_lockout` |
 
 ## WebSocket variant
@@ -98,7 +98,9 @@ gateway on loopback or a VPN and the short challenge lifetime limit exposure.
 
 Resuming never bypasses key authentication:
 
-- A browser login is a cookie with an 8 h absolute and 30 min idle lifetime. While it's valid, reopening
+- A browser login is a cookie with an 8 h absolute and 30 min idle lifetime. Typing in a terminal and using
+  the page count as activity; the page's own background refresh of the session list (`X-Sshweb-Poll: 1`)
+  and terminal output don't, so a page left open still goes idle. While it's valid, reopening
   the page restores your tabs without a new signature.
 - Once it has expired, you sign a new challenge exactly as above. There is no long-lived "remember me"
   token, and saved tabs and detached shells are only reachable through a fresh login.

@@ -81,13 +81,15 @@ sessions:
 limits:
   ws_max_message_bytes: 65536
   max_websockets: 64
+  ws_auth_timeout_secs: 30                 # a socket not signed in this long after connecting is closed
+  max_unauthenticated_websockets_per_ip: 8 # sockets not signed in yet, per client IP
   input_bytes_per_sec: 262144
   input_burst_bytes: 1048576
   max_http_body_bytes: 32768
 
 rate_limit:
   challenges_per_minute: 20   # per client IP
-  max_failures: 5             # failed logins per IP or per user within the window...
+  max_failures: 5             # failed logins per IP (user names aren't locked) within the window...
   failure_window_secs: 300
   lockout_secs: 900           # ...trigger a lockout of this length
 
@@ -110,12 +112,13 @@ logging:
 #   webhook_url: https://int-opsapi.workstation.co.uk/api/v2/ai-runner/public/terminal/webhook
 #   webhook_secret: "<from OpsAPI>"
 #   agents:       # a link names an agent id; the command line only ever comes from here
-#     - { id: claude, name: Claude Code, run: 'claude "$OPSAPI_TASK_PROMPT"' }
-#     - { id: codex,  name: Codex,       run: 'codex "$OPSAPI_TASK_PROMPT"' }
-#     - { id: cursor, name: Cursor,      run: 'cursor-agent "$OPSAPI_TASK_PROMPT"' }
+#     # `--` before the prompt, so a prompt starting with `-` is never read as an option.
+#     - { id: claude, name: Claude Code, run: 'claude -- "$OPSAPI_TASK_PROMPT"' }
+#     - { id: codex,  name: Codex,       run: 'codex -- "$OPSAPI_TASK_PROMPT"' }
+#     - { id: cursor, name: Cursor,      run: 'cursor-agent -- "$OPSAPI_TASK_PROMPT"' }
 #     # Never stops to ask before running commands or editing files. Only acceptable because this
 #     # terminal runs under its own macOS account (docs/OPSAPI.md); leave it out to forbid it.
-#     - { id: claude_auto, name: "Claude Code (unattended)", run: 'claude --dangerously-skip-permissions "$OPSAPI_TASK_PROMPT"' }
+#     - { id: claude_auto, name: "Claude Code (unattended)", run: 'claude --dangerously-skip-permissions -- "$OPSAPI_TASK_PROMPT"' }
 #   idle_timeout_secs: 14400   # task tabs: closed after this long with neither input nor output
 #   detach_grace_secs: 14400   # task tabs: kept running this long after the browser closes
 #   autologin:                 # let OpsAPI sign chosen people in with a task link (off by default)

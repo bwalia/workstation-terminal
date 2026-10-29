@@ -75,17 +75,14 @@ impl AuthService {
         }
     }
 
-    pub fn check_lockout(&self, ip: &str, user: Option<&str>) -> Result<(), AuthError> {
-        let mut keys = vec![format!("ip:{ip}")];
-        if let Some(u) = user {
-            keys.push(format!("user:{u}"));
+    /// Is this IP locked out after repeated failures? Only IPs are: a user name isn't, so nobody
+    /// can lock a named person out by sending bad signatures for them (which can't be guessed
+    /// anyway).
+    pub fn check_lockout(&self, ip: &str) -> Result<(), AuthError> {
+        match self.failures.locked(&format!("ip:{ip}")) {
+            Some(rem) => Err(AuthError::LockedOut(rem.as_secs().max(1))),
+            None => Ok(()),
         }
-        for k in keys {
-            if let Some(rem) = self.failures.locked(&k) {
-                return Err(AuthError::LockedOut(rem.as_secs().max(1)));
-            }
-        }
-        Ok(())
     }
 
     /// Issue a challenge. Unknown users get a challenge too, so user names cannot be probed.
@@ -104,7 +101,7 @@ impl AuthService {
                 .log(AuditEvent::new("auth_rate_limited").ip(ip).user(user));
             return Err(AuthError::RateLimited);
         }
-        self.check_lockout(ip, Some(user))?;
+        self.check_lockout(ip)?;
         let ch = self.challenges.issue(user, origin, binding).map_err(|e| {
             if e == ChallengeError::Capacity {
                 AuthError::RateLimited
@@ -131,7 +128,7 @@ impl AuthService {
         ip: &str,
         via: &'static str,
     ) -> Result<(String, Login), AuthError> {
-        self.check_lockout(ip, None)?;
+        self.check_lockout(ip)?;
         let result = self.verify_inner(challenge_id, signature, binding, ip, via);
         match &result {
             Ok((_, login)) => self.record_sign_in(login, ip, via, &[]),
@@ -149,7 +146,7 @@ impl AuthService {
             self.audit.log(AuditEvent::new("auth_rate_limited").ip(ip));
             return Err(AuthError::RateLimited);
         }
-        self.check_lockout(ip, None)
+        self.check_lockout(ip)
     }
 
     /// Sign `key`'s user in without a challenge (the caller has proved who they are another
@@ -161,7 +158,7 @@ impl AuthService {
         via: &'static str,
         extra: &[(&str, &str)],
     ) -> Result<(String, Login), AuthError> {
-        self.check_lockout(ip, Some(&key.user))?;
+        self.check_lockout(ip)?;
         let (token, login) =
             self.logins
                 .create(&key.user, &key.fingerprint, key.access.clone(), ip, via);
@@ -171,8 +168,6 @@ impl AuthService {
 
     fn record_sign_in(&self, login: &Login, ip: &str, via: &str, extra: &[(&str, &str)]) {
         self.failures.record_success(&format!("ip:{ip}"));
-        self.failures
-            .record_success(&format!("user:{}", login.user));
         self.metrics.inc(&self.metrics.auth_success);
         let mut ev = AuditEvent::new("auth_success")
             .ip(ip)
@@ -186,7 +181,7 @@ impl AuthService {
         self.audit.log(ev);
     }
 
-    /// Audit a failed sign-in and count it towards the IP's (and user's) lock-out.
+    /// Audit a failed sign-in and count it towards the IP's lock-out.
     pub fn record_failed_sign_in(
         &self,
         ip: &str,
@@ -207,11 +202,7 @@ impl AuthService {
             ev = ev.field(k, v);
         }
         self.audit.log(ev);
-        let mut locked = self.failures.record_failure(&format!("ip:{ip}"));
-        if let Some(u) = user {
-            locked |= self.failures.record_failure(&format!("user:{u}"));
-        }
-        if locked {
+        if self.failures.record_failure(&format!("ip:{ip}")) {
             self.metrics.inc(&self.metrics.auth_lockouts);
             let mut ev = AuditEvent::new("auth_lockout").ip(ip);
             if let Some(u) = user {
@@ -234,8 +225,6 @@ impl AuthService {
             .take(challenge_id, binding)
             .map_err(|e| (None, e.into()))?;
         let user = Some(ch.user.clone());
-        self.check_lockout(ip, Some(&ch.user))
-            .map_err(|e| (user.clone(), e))?;
         let keys = self
             .keys
             .current()
@@ -256,7 +245,13 @@ impl AuthService {
     /// Like [`validate`](Self::validate) but without refreshing the idle timer; used for
     /// periodic background checks so an idle open tab does not keep a login alive.
     pub fn check_still_valid(&self, token: &str) -> bool {
-        self.validate_with(token, false).is_some()
+        self.validate_quietly(token).is_some()
+    }
+
+    /// [`validate`](Self::validate) for a background poll: the login, without counting the
+    /// request as activity.
+    pub fn validate_quietly(&self, token: &str) -> Option<Login> {
+        self.validate_with(token, false)
     }
 
     fn validate_with(&self, token: &str, touch: bool) -> Option<Login> {

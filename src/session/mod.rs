@@ -265,6 +265,9 @@ impl TerminalSession {
         if a.as_ref().is_some_and(|x| x.conn_id == conn_id) {
             *a = None;
             *self.detached_since.lock().unwrap() = Some(Instant::now());
+            if let Some(t) = &self.work {
+                t.set_attached(false);
+            }
             true
         } else {
             false
@@ -545,6 +548,9 @@ impl SessionManager {
         let snapshot = sess.scrollback.lock().unwrap().snapshot();
         *a = Some(Attachment { conn_id, tx });
         *sess.detached_since.lock().unwrap() = None;
+        if let Some(t) = &sess.work {
+            t.set_attached(true);
+        }
         (rx, snapshot)
     }
 

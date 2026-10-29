@@ -29,12 +29,13 @@ turned on [auto sign-in](#auto-sign-in-for-power-users) for that person.
      webhook_url: https://int-opsapi.workstation.co.uk/api/v2/ai-runner/public/terminal/webhook
      webhook_secret: "<from OpsAPI>"      # or SSHWEB_OPSAPI_WEBHOOK_SECRET
      agents:                              # ids must match the agents listed in OpsAPI
-       - { id: claude, name: Claude Code, run: 'claude "$OPSAPI_TASK_PROMPT"' }
-       - { id: codex,  name: Codex,       run: 'codex "$OPSAPI_TASK_PROMPT"' }
-       - { id: cursor, name: Cursor,      run: 'cursor-agent "$OPSAPI_TASK_PROMPT"' }
+       # `--` before the prompt, so a prompt starting with `-` is never read as an option.
+       - { id: claude, name: Claude Code, run: 'claude -- "$OPSAPI_TASK_PROMPT"' }
+       - { id: codex,  name: Codex,       run: 'codex -- "$OPSAPI_TASK_PROMPT"' }
+       - { id: cursor, name: Cursor,      run: 'cursor-agent -- "$OPSAPI_TASK_PROMPT"' }
        # Never stops to ask. Only acceptable because this gateway runs under its own macOS
        # account (below); leave it out to forbid unattended agents.
-       - { id: claude_auto, name: "Claude Code (unattended)", run: 'claude --dangerously-skip-permissions "$OPSAPI_TASK_PROMPT"' }
+       - { id: claude_auto, name: "Claude Code (unattended)", run: 'claude --dangerously-skip-permissions -- "$OPSAPI_TASK_PROMPT"' }
      idle_timeout_secs: 14400             # task tabs: 4 h with neither input nor output
      detach_grace_secs: 14400             # task tabs keep running 4 h after the browser closes
    ```
@@ -53,7 +54,9 @@ environment variables, so its text is never parsed as shell syntax:
 | `OPSAPI_TASK`, `OPSAPI_LAUNCH` | Task id and launch id |
 | `OPSAPI_REPORT_URL`, `OPSAPI_REPORT_TOKEN` | Where and how the agent tells OpsAPI about its pull request (only when the link has `report`) |
 
-Always quote it (`"$OPSAPI_TASK_PROMPT"`).
+Always quote it and put `--` before it (`claude -- "$OPSAPI_TASK_PROMPT"`), so a prompt that starts with
+`-` (say `--settings=…`) is never read as an option. The gateway also refuses such a prompt
+(`prompt_starts_with_dash`), for run lines written without the `--`.
 
 ## What happens
 
@@ -66,8 +69,9 @@ Always quote it (`"$OPSAPI_TASK_PROMPT"`).
    - resolves the folder with `realpath` and requires an existing directory inside `local.allowed_roots`
      (symlinks can't escape);
    - looks the agent id up in `opsapi.agents`.
-   Errors: `invalid_link`, `expired`, `not_configured`, `folder_not_found`, `folder_not_allowed`,
-   `unknown_agent` (400), `forbidden` (403), `already_used` (409, another user accepted it).
+   Errors: `invalid_link`, `expired`, `not_configured`, `prompt_starts_with_dash` (the prompt's first
+   non-blank character is `-`), `folder_not_found`, `folder_not_allowed`, `unknown_agent` (400),
+   `forbidden` (403), `already_used` (409, another user accepted it).
 3. The page opens a tab with `{"type":"open","target":{"kind":"local"},"launch":"<id>"}`. The folder,
    agent and environment come only from the accepted launch. The launch is then used up: re-posting the
    link returns the running session (a page reload re-attaches it); opening it again is refused.
@@ -133,6 +137,9 @@ Then:
 - Audit events: `opsapi_key_added`, `opsapi_key_removed` (user and fingerprint), `opsapi_keys_stale`;
   sign-ins as before (`auth_success` with the user and key fingerprint).
 - Auto sign-in (below) finds these people by the email in the list, so they need no `autologin.users` line.
+- Each entry is `{user, public_key, expires_unix, email?, name?}`. `name` (the person's name, one line,
+  ≤ 120 characters) is optional; a bad one is left out and the key still works. Their shells get the email
+  and name (see [Crediting each person](#crediting-each-person)).
 
 ## Auto sign-in for power users
 
@@ -184,7 +191,7 @@ Errors (`{"error": "<code>", "message": "…"}`):
 | Status | `error` | When |
 |---|---|---|
 | 400 | `invalid_link` | bad signature or fields, lifetime over 120 s, or `stepup` later than `iat` |
-| 400 | `expired`, `not_configured` | as for `/api/launch` |
+| 400 | `expired`, `not_configured`, `prompt_starts_with_dash` | as for `/api/launch` |
 | 403 | `autologin_off` | `opsapi.autologin.enabled` is false (or local terminals are off); not counted towards lock-out |
 | 403 | `autologin_not_allowed` | the link has no `login`, the email isn't mapped, or the mapped user has no key allowing `local` |
 | 403 | `stepup_stale` | the step-up is older than `max_stepup_age_secs` |
@@ -210,7 +217,7 @@ it keeps the text they give Claude and what their screen shows.
 
 | What | Recorded |
 |---|---|
-| Tab (local and remote) | terminal user and key fingerprint, sign-in (`key` / `opsapi_launch`), IP, the task link if any, folder, agent, opened/closed, how it ended, exit code, active seconds (counted every 10 s when there was input or output in the last 60 s), bytes in/out |
+| Tab (local and remote) | terminal user and key fingerprint, sign-in (`key` / `opsapi_launch`), IP, the task link if any, folder, agent, opened/closed, how it ended, exit code, active seconds (counted every 10 s when there was input or output in the last 60 s), bytes in/out, when the last keystroke came, whether a browser is connected |
 | Claude Code (from its own OpenTelemetry) | each prompt's text (cut to 16 KiB), each model request (model, tokens, cost estimate, duration), tool results and decisions (tool, success, parameters cut to 8 KiB), API errors, lines added/removed, commits, pull requests. Codex, Cursor and plain shells send nothing here. |
 | Screen (local tabs) | the tab's **output**, what the screen shows, as an [asciicast v2](https://docs.asciinema.org/manual/asciicast/v2/) recording (`o` and `r` events). **Keystrokes are never recorded**, but what the terminal echoes back is on screen (passwords at a no-echo prompt aren't). |
 
@@ -246,10 +253,16 @@ How it works:
   the `claude_code.{lines_of_code,commit,pull_request}.count` and `claude_code.active_time.total`
   metrics are kept.
 - Every 10 s, when something is new, the gateway sends `POST {url}/activity` (`X-Opsapi-Terminal`,
-  `X-Opsapi-Signature: sha256=<hex HMAC of the body>`): tabs at open, at close and every 60 s while they
-  change, and the new events. While OpsAPI can't be reached they wait in memory (up to 20 000 events,
+  `X-Opsapi-Signature: sha256=<hex HMAC of the body>`): each tab at open, at close and once a minute while
+  it is open, changed or not (a heartbeat: a tab not heard of for a few minutes went away with its
+  gateway), and the new events. While OpsAPI can't be reached they wait in memory (up to 20 000 events,
   oldest dropped first) and are retried with backoff up to 5 minutes. A clean shutdown sends the tabs'
   final state.
+- A tab's state, which OpsAPI upserts by `id`: `id`, `user`, `key`, `via`, `ip`, `launch`, `kind`, `cwd`,
+  `agent`, `opened_at`, `closed_at`, `end_reason`, `exit_code`, `active_secs`, `input_bytes`,
+  `output_bytes`, and from this version `last_input_at` (unix seconds of the tab's last keystroke or
+  paste; `null` before the first) and `attached` (a browser is connected to the tab now; `false` once
+  closed). Older gateways send neither, and later ones may add fields: ignore what you don't know.
 - A recording part closes every 60 s or 1 MiB and when its tab ends, is gzipped to
   `<state_dir>/recordings/<tab>-<part>.cast.gz` (0600), sent as `POST {url}/recordings`
   (`X-Opsapi-Tab`, `X-Opsapi-Part`, `X-Opsapi-Final`, signature over `"<tab>\n<part>\n"` + body) and
@@ -368,6 +381,34 @@ local <key>.pub`. Admin commands talk to the running gateway as its account:
 Finally route a public name to it (reverse proxy → `https://<mac>:7682`, see "Behind a reverse proxy"
 in the README) and enter that address in OpsAPI.
 
+### Crediting each person
+
+Everyone's shells run as `workstation`, so git would put that account's one `user.name`/`user.email` on
+every commit. Each local tab's shell also gets who it is for:
+
+| Variable | Value |
+|---|---|
+| `SSHWEB_USER` | The terminal user they signed in as |
+| `SSHWEB_USER_EMAIL` | Their OpsAPI email (keys issued in OpsAPI) |
+| `SSHWEB_USER_NAME` | Their name, when OpsAPI sends it with their key |
+
+sudo keeps them (`SSHWEB_*` in `env_keep`). To credit the person in git, add this to the account's
+`~/.zshenv`, which every zsh reads (`~/.bash_profile` too if people use bash):
+
+```sh
+# Commits made in an sshweb tab are credited to the person signed in there.
+if [ -n "$SSHWEB_USER_EMAIL" ]; then
+  export GIT_AUTHOR_EMAIL="$SSHWEB_USER_EMAIL" GIT_COMMITTER_EMAIL="$SSHWEB_USER_EMAIL"
+fi
+if [ -n "$SSHWEB_USER_NAME" ]; then
+  export GIT_AUTHOR_NAME="$SSHWEB_USER_NAME" GIT_COMMITTER_NAME="$SSHWEB_USER_NAME"
+fi
+```
+
+Without them (a key from `authorized_keys`, or an OpsAPI that sends no name) git uses the global
+identity. This says who was signed in, not proof: anyone can change the variables in their own tab. Pushes
+still go through the account's one GitHub login.
+
 ### Shells locked to their folder
 
 `local.sandbox_profile: /usr/local/etc/sshweb/shell.sb` (macOS) runs every local shell inside a
@@ -375,20 +416,60 @@ sandbox (`sandbox-exec`) that everything started from it inherits and can't loos
 [packaging/sshweb-shell.sb](../packaging/sshweb-shell.sb):
 
 - **files:** under `/Users` only the shells' own account folder (the projects plus the tools'
-  settings and caches); no other account's files, no `/Volumes`. The shared set-up is read-only:
-  shell start-up files, the agents' Claude and GitHub logins, git's identity, Claude's user settings;
+  settings and caches); no other account's files, no `/Volumes`. What runs in everyone's sessions is
+  read-only, so nobody can plant something there that runs when a colleague starts a shell or Claude:
+  shell start-up files (`~/.zshrc` and friends, `~/.oh-my-zsh`, `~/.zsh`), the folders on PATH in the
+  home (`~/bin`, `~/.local/bin`) and the Claude that `~/.local/bin/claude` points to
+  (`~/.local/share/claude`), the agents' Claude and GitHub logins, git's identity, and what Claude loads
+  for everyone: its user settings, `CLAUDE.md`, commands, agents, skills, plugins and hooks. Their folders
+  (`~/.claude`, `~/.config`, `~/.local`) can't be moved aside and replaced by a link either. Claude keeps
+  its own state as usual (`~/.claude.json`, `~/.claude/projects`, todos and the rest). It can't update
+  itself from a tab: update it as the account, `sudo -iu workstation claude update`;
+- **processes:** a shell can inspect (open files, folder, path) and signal only what was started in its own
+  tab, not another person's shell or agent and not the gateway. Job control (Ctrl+Z, `bg`, `kill %1`) and
+  Ctrl+C work as usual. `ps` and `top` don't run inside any sandbox (they are setuid); `pgrep` does;
 - **network:** out on ports 443 and 80 only (GitHub over https, Claude, OpsAPI, package registries).
   Not the services on this Mac or the local network (databases, AI servers, dashboards, file and
   screen sharing), not ssh. On this Mac only the work log's receiver (`OTLP_PORT`) and a few usual
   dev-server ports (3000, 3001, 4173, 5173, 8000) a person starts in their own terminal.
 
+A sandbox profile can't name address ranges, so hosts on the local network stay reachable on 443 and 80.
+Block those with pf, for the shells' account only, e.g. `/etc/pf.anchors/sshweb`:
+
+```
+# The shells' account may not reach the local network.
+block return out quick proto { tcp, udp } from any to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, fc00::/7, fe80::/10 } user workstation
+```
+
+Add `anchor "sshweb"` and `load anchor "sshweb" from "/etc/pf.anchors/sshweb"` to `/etc/pf.conf`, check
+with `sudo pfctl -vnf /etc/pf.conf`, then `sudo pfctl -E -f /etc/pf.conf`. pf isn't on at boot unless a
+LaunchDaemon turns it on, and macOS updates can restore `/etc/pf.conf`. Check from a tab:
+`nc -z -G 2 <a host on the local network> 443` should fail. (This project's tests don't cover pf.)
+
 sshweb passes `HOME` (the account's folder) and `OTLP_PORT` and starts
 `sudo … sandbox-exec -f <profile> -D … <shell>`; each step hands over to the next, so the gateway still
 stops the shell. `config validate` starts a test shell in it. Install the profile root-owned (0644).
-Administrators set the account up (logins, repos) outside the sandbox: `sudo -u workstation -i`.
+Administrators set the account up (logins, repos, tools, Claude's commands and skills) outside the
+sandbox: `sudo -u workstation -i`.
 
 What this separates and what it doesn't: the gateway, its secret and its records from everything run in a
-terminal (real), and the terminals from the owner's account (real). People sharing `workstation` can
-still see and change each other's work in it, including each other's tab tokens: separation between
-them is by policy only. Their shells' terminal device belongs to `_sshweb`, so the rare program that
-reopens its terminal by name (rather than `/dev/tty`) can't; ssh, git, editors and agents don't.
+terminal (real), and the terminals from the owner's account (real). Between the people sharing
+`workstation`, much is still shared, and separation there is by policy only:
+
+- the projects: anyone can change anyone's code, including a repository's own agent set-up that runs when
+  someone else works in it (`.claude/settings.json` hooks, `.claude/commands`, `.mcp.json`, `CLAUDE.md`,
+  git hooks, package scripts);
+- `~/.claude.json`, which Claude must be able to write. It also holds per-project MCP servers, which are
+  commands Claude starts;
+- what the tools keep: everyone's Claude conversations (`~/.claude/projects`) and shell history
+  (`~/.zsh_history`);
+- other tools installed in the home (nvm, npm's global folder, `~/.cargo/bin`, …): anyone can replace
+  them. Install shared tools outside it (Homebrew owned by an administrator), or add their folders to the
+  profile;
+- command lines and environments: `pgrep -fl` lists everyone's commands (an agent's prompt included), and
+  a program can read another process's environment, tab tokens and report tokens included. macOS doesn't
+  let a sandbox stop that.
+
+Real separation between people needs an account each. Their shells' terminal device belongs to `_sshweb`,
+so the rare program that reopens its terminal by name (rather than `/dev/tty`) can't; ssh, git, editors and
+agents don't.

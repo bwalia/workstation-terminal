@@ -64,8 +64,8 @@
     $("btn-terminal-view").classList.toggle("hidden", view !== "settings");
     if (view === "term" && active) setTimeout(() => active.fit(), 0);
   }
-  async function api(method, path, body) {
-    const opts = { method, credentials: "same-origin", headers: {} };
+  async function api(method, path, body, headers) {
+    const opts = { method, credentials: "same-origin", headers: Object.assign({}, headers) };
     if (body !== undefined) {
       opts.headers["Content-Type"] = "application/json";
       opts.body = JSON.stringify(body);
@@ -80,6 +80,15 @@
       throw err;
     }
     return data;
+  }
+  const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || "");
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast("Copied", "ok");
+    } catch (_) {
+      toast("Couldn't copy here; press " + (IS_MAC ? "⌘C" : "Ctrl+Insert") + " instead", "error");
+    }
   }
   function shellQuote(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
   function newId() {
@@ -134,11 +143,33 @@
         fontSize: prefs.fontSize,
         scrollback: 5000,
         macOptionIsMeta: !!prefs.optionMeta,
+        // ⌥ Option+drag (Shift+drag elsewhere) selects text even while a program that uses the
+        // mouse (Claude Code, vim, less, tmux) is running.
+        macOptionClickForcesSelection: true,
+        rightClickSelectsWord: false,
         theme: THEMES[prefs.theme],
       });
       this.fitAddon = new window.FitAddon.FitAddon();
       this.term.loadAddon(this.fitAddon);
       this.term.open(this.el);
+      // Right-click on a selection copies it. Caught on the press, before xterm sees it: in a program
+      // that uses the mouse xterm would send the press to the program and clear the selection. Without
+      // a selection the browser's own menu (Paste) shows as usual.
+      let copiedOnPress = false;
+      this.el.addEventListener("mousedown", (e) => {
+        copiedOnPress = e.button === 2 && this.term.hasSelection();
+        if (!copiedOnPress) return;
+        e.preventDefault();
+        e.stopPropagation();
+        copyText(this.term.getSelection());
+      }, true);
+      this.el.addEventListener("contextmenu", (e) => {
+        if (!copiedOnPress && !this.term.hasSelection()) return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (!copiedOnPress) copyText(this.term.getSelection());
+        copiedOnPress = false;
+      }, true);
       // Keystrokes are only sent while bound to a live session; anything typed while
       // disconnected is dropped, never queued, so nothing is replayed after a reconnect.
       this.term.onData((data) => { if (this.live) this.send({ type: "input", data }); });
@@ -527,10 +558,13 @@
   }
 
   // ---------- session list ----------
-  async function refreshSessions() {
+  // `background`: the timer's refresh, which the server doesn't count as activity, so a page left
+  // open still lets the login go idle. Typing in a terminal counts.
+  async function refreshSessions(background) {
     if (!me) return;
     let data;
-    try { data = await api("GET", "/api/sessions"); } catch (e) {
+    const poll = background === true ? { "X-Sshweb-Poll": "1" } : undefined;
+    try { data = await api("GET", "/api/sessions", undefined, poll); } catch (e) {
       if (e.status === 401) toLogin("Please sign in.");
       return;
     }
@@ -650,7 +684,7 @@
   }
   $("btn-connect").addEventListener("click", openNewTab);
   $("btn-newtab").addEventListener("click", openNewTab);
-  $("btn-refresh").addEventListener("click", refreshSessions);
+  $("btn-refresh").addEventListener("click", () => refreshSessions());
   $("btn-rename").addEventListener("click", () => { if (active) renameTab(active); });
   $("term-title").addEventListener("dblclick", () => { if (active) renameTab(active); });
   $("btn-clear").addEventListener("click", () => { if (active) { active.term.clear(); active.term.focus(); } });
@@ -864,6 +898,8 @@
   $("set-theme").value = prefs.theme;
   $("set-font").value = prefs.fontSize;
   $("set-meta").checked = !!prefs.optionMeta;
+  if (!IS_MAC) $("select-hint").textContent = $("select-hint").textContent.replace("⌥ Option", "Shift");
+  $("select-hint").title = $("select-hint").textContent;
   document.documentElement.setAttribute("data-theme", prefs.theme);
   try {
     // A link from OpsAPI can name the user (?user=…), so people only pick their key file.
@@ -875,6 +911,6 @@
   window.addEventListener("online", () => {
     for (const t of tabs) if (t.started && !t.ws && t.sessionId) t.reconnect();
   });
-  setInterval(() => { if (me) refreshSessions(); }, 15000);
+  setInterval(() => { if (me) refreshSessions(true); }, 15000);
   enter();
 })();
