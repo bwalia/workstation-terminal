@@ -82,13 +82,80 @@
     return data;
   }
   const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || "");
-  async function copyText(text) {
+  // Older path for browsers that refuse the async Clipboard API (no permission, or no focus):
+  // copy from a hidden text box. Only works inside a click or key press.
+  function copyByCommand(text) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0";
+    const prev = document.activeElement;
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (_) { ok = false; }
+    ta.remove();
+    if (prev && prev.focus) prev.focus();
+    return ok;
+  }
+  async function writeClipboard(text) {
     try {
-      await navigator.clipboard.writeText(text);
-      toast("Copied", "ok");
-    } catch (_) {
-      toast("Couldn't copy here; press " + (IS_MAC ? "⌘C" : "Ctrl+Insert") + " instead", "error");
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (_) { /* fall through */ }
+    return copyByCommand(text);
+  }
+  async function copyText(text, note) {
+    if (await writeClipboard(text)) {
+      toast(note || "Copied", "ok");
+    } else {
+      toast("Couldn't copy here; press " + (IS_MAC ? "⌘C" : "Ctrl+Shift+C") + " instead", "error");
     }
+  }
+  // A toast with one button, for a copy the browser only allows from a click.
+  function toastAction(msg, label, fn) {
+    const el = document.createElement("div");
+    el.className = "toast";
+    el.append(msg + " ");
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "ghost";
+    b.textContent = label;
+    b.addEventListener("click", () => { el.remove(); fn(); });
+    el.appendChild(b);
+    $("toasts").appendChild(el);
+    setTimeout(() => el.remove(), 15000);
+  }
+  // OSC 52 ("ESC ] 52 ; c ; <base64> BEL"): a program in the terminal (tmux, vim, Claude, or a shell
+  // on a remote host) puts text on this computer's clipboard. Write-only: a query ("?") is ignored,
+  // so nothing in the terminal can read what is on the clipboard. Only the tab in front, in a
+  // focused window, may copy, and each copy is announced.
+  const OSC52_MAX = 1024 * 1024; // base64 characters (~768 KB of text)
+  function osc52Handler(tab) {
+    return (data) => {
+      const semi = data.indexOf(";");
+      if (semi < 0) return true;
+      const payload = data.slice(semi + 1);
+      if (payload === "?" || payload.length > OSC52_MAX) return true;
+      if (tab !== active || document.hidden || !document.hasFocus()) return true;
+      let text;
+      try {
+        const bin = atob(payload);
+        text = new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+      } catch (_) {
+        return true;
+      }
+      if (!text) return true;
+      const note = "Copied " + text.length + " characters from the terminal";
+      writeClipboard(text).then((ok) => {
+        if (ok) toast(note, "ok");
+        else toastAction("A program in the terminal wants to copy " + text.length + " characters.", "Copy",
+          () => copyText(text, note));
+      });
+      return true;
+    };
   }
   function shellQuote(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
   function newId() {
@@ -176,6 +243,7 @@
       this.term.onBinary((data) => { if (this.live) this.send({ type: "input", data, binary: true }); });
       this.term.onResize(({ cols, rows }) => { if (this.live) this.send({ type: "resize", cols, rows }); });
       this.term.attachCustomKeyEventHandler((e) => shortcut(e));
+      this.term.parser.registerOscHandler(52, osc52Handler(this));
 
       this.tabEl = document.createElement("div");
       this.tabEl.className = "tab";
@@ -551,6 +619,13 @@
   function shortcut(e) {
     if (e.type !== "keydown" || !e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey || !active) return true;
     const k = e.key.toLowerCase();
+    // Ctrl+Shift+C copies the selection (Windows/Linux terminals' copy; Chrome would open DevTools).
+    // Without a selection it does nothing, and never sends Ctrl+C to the program.
+    if (k === "c") {
+      if (active.term.hasSelection()) copyText(active.term.getSelection());
+      e.preventDefault();
+      return false;
+    }
     if (k === "k") { active.term.clear(); e.preventDefault(); return false; }
     if (k === "u") { active.reconnect(); e.preventDefault(); return false; }
     if (k === "x") { active.detach(); e.preventDefault(); return false; }
